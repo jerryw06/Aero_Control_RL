@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Fast DDS default profiles to allow dynamic resizing of history payloads.
+  Use by exporting:
+    export FASTDDS_DEFAULT_PROFILES_FILE="/path/to/fastdds_profile.xml"
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <participant profile_name="default_participant" is_default_profile="true">
+    <rtps>
+      <useBuiltinTransports>true</useBuiltinTransports>
+      <allocation>
+        <!-- Allow reallocating history payloads to avoid 'cannot be resized' errors -->
+        <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
+      </allocation>
+    </rtps>
+  </participant>
+
+  <subscriber profile_name="default_subscriber" is_default_profile="true">
+    <qos>
+      <history>
+        <kind>KEEP_LAST</kind>
+        <depth>50</depth>
+      </history>
+      <resourceLimits>
+        <allocated_samples>200</allocated_samples>
+        <max_samples>1000</max_samples>
+      </resourceLimits>
+      <reliability>
+        <kind>BEST_EFFORT_RELIABILITY_QOS</kind>
+      </reliability>
+      <durability>
+        <kind>VOLATILE_DURABILITY_QOS</kind>
+      </durability>
+    </qos>
+  </subscriber>
+
+  <publisher profile_name="default_publisher" is_default_profile="true">
+    <qos>
+      <history>
+        <kind>KEEP_LAST</kind>
+        <depth>50</depth>
+      </history>
+      <resourceLimits>
+        <allocated_samples>200</allocated_samples>
+        <max_samples>1000</max_samples>
+      </resourceLimits>
+      <reliability>
+        <kind>BEST_EFFORT_RELIABILITY_QOS</kind>
+      </reliability>
+      <durability>
+        <kind>VOLATILE_DURABILITY_QOS</kind>
+      </durability>
+    </qos>
+  </publisher>
+</profiles>

@@ -1,0 +1,21 @@
+.
+|-- build.sh
+|-- CMakeLists.txt
+|-- DIRECTORY_STRUCTURE.txt
+|-- IMPLEMENTATION_SUMMARY.md
+|-- include
+|   |-- policy_network.hpp
+|   |-- px4_accel_env.hpp
+|   `-- px4_node.hpp
+|-- install_and_setup.sh
+|-- package.xml
+|-- QUICKSTART.md
+|-- README.md
+|-- setup.sh
+`-- src
+    |-- policy_network.cpp
+    |-- px4_accel_env.cpp
+    |-- px4_node.cpp
+    `-- train_rl.cpp
+
+3 directories, 16 files

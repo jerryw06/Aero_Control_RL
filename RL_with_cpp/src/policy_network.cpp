@@ -1,8 +1,9 @@
 ﻿#include "policy_network.hpp"
 #include <cmath>
 
-PolicyImpl::PolicyImpl(int obs_dim, int hidden, int num_layers, double act_limit)
-    : act_limit_(act_limit)
+PolicyImpl::PolicyImpl(int obs_dim, int hidden, int num_layers, double act_limit, int act_dim)
+    : act_limit_(act_limit),
+      act_dim_(act_dim)
 {
     net_ = torch::nn::Sequential();
     int in_dim = obs_dim;
@@ -12,20 +13,20 @@ PolicyImpl::PolicyImpl(int obs_dim, int hidden, int num_layers, double act_limit
         net_->push_back(torch::nn::Tanh());
         in_dim = hidden;
     }
-    net_->push_back(torch::nn::Linear(hidden, 1));
+    net_->push_back(torch::nn::Linear(hidden, act_dim_));
     register_module("net", net_);
 
-    // Learnable log_std parameter (scalar)
-    log_std_ = register_parameter("log_std", torch::tensor(-0.5, torch::kFloat32));
+    // Learnable log_std parameter per action dimension
+    log_std_ = register_parameter("log_std", torch::full({act_dim_}, -0.5f));
 }
 
 std::pair<torch::Tensor, torch::Tensor> PolicyImpl::forward(torch::Tensor obs_t) {
     auto mu = net_->forward(obs_t);
     auto std = torch::exp(log_std_).clamp(1e-3, 2.0);
-    // Broadcast std to mu shape if needed
-    if (std.sizes() != mu.sizes()) {
-        std = std.expand_as(mu);
+    if (std.dim() == 1) {
+        std = std.unsqueeze(0);
     }
+    std = std.expand_as(mu);
     return {mu, std};
 }
 
@@ -43,8 +44,10 @@ PolicyImpl::sample_action(torch::Tensor obs_np) {
     auto a_tanh = torch::tanh(a) * act_limit_;
     
     // Compute log probability with tanh correction
-    auto log_prob = -0.5 * torch::pow((a - mu) / std, 2) - 0.5 * std::log(2 * M_PI) - torch::log(std);
+    auto log_prob = -0.5 * torch::pow((a - mu) / std, 2)
+                    - 0.5 * std::log(2 * M_PI) - torch::log(std);
     log_prob = log_prob - torch::log(1 - torch::pow(torch::tanh(a), 2) + 1e-6);
+    log_prob = log_prob.sum(-1, true);
     
-    return {a_tanh.squeeze(0), log_prob.squeeze(0), mu.squeeze(0), std};
+    return {a_tanh.squeeze(0), log_prob.squeeze(0), mu.squeeze(0), std.squeeze(0)};
 }

@@ -5,18 +5,27 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <algorithm>
 
 using namespace std::chrono_literals;
+
+namespace {
+constexpr double DEG2RAD = M_PI / 180.0;
+constexpr double RAD2DEG = 180.0 / M_PI;
+constexpr float GRAVITY = -9.81f;
+}
 
 PX4AccelEnv::PX4AccelEnv(double rate_hz, double a_max, double ep_time_s,
                          double target_up_m, double target_lateral_m,
                          double start_up_m, double takeoff_kp, double takeoff_kd,
                          double takeoff_tol, int settle_steps, double takeoff_max_time,
                          bool safety_verbose)
-    : rate_hz_(rate_hz),
-      dt_(1.0 / rate_hz),
+    : rate_cap_hz_(150.0),
+      requested_rate_hz_(rate_hz),
+      rate_hz_(std::max(1.0, std::min(rate_hz, rate_cap_hz_))),
+      dt_(1.0 / std::max(1.0, std::min(rate_hz, rate_cap_hz_))),
       a_max_(a_max),
-      max_steps_(static_cast<int>(ep_time_s * rate_hz)),
+      max_steps_(static_cast<int>(ep_time_s * rate_hz_)),
       target_up_(target_up_m),
       target_lateral_(target_lateral_m),
       start_up_m_(start_up_m),
@@ -53,6 +62,17 @@ PX4AccelEnv::PX4AccelEnv(double rate_hz, double a_max, double ep_time_s,
       oscillation_window_(20),
       oscillation_flips_(6),
       max_action_slew_rate_(20.0),
+      roll_limit_deg_(35.0),
+      pitch_limit_deg_(35.0),
+      yaw_limit_deg_(180.0),
+      unsafe_roll_deg_(45.0),
+      unsafe_pitch_deg_(45.0),
+      unsafe_yaw_rate_deg_s_(120.0),
+      yaw_rate_limit_deg_s_(360.0),
+      yaw_rate_limit_rad_s_(yaw_rate_limit_deg_s_ * DEG2RAD),
+      obs_dim_(12),
+      act_dim_(4),
+      enforce_attitude_limits_(false),
       // PD gains
       hold_kp_(2.0),
       hold_kd_(1.0),
@@ -62,7 +82,6 @@ PX4AccelEnv::PX4AccelEnv(double rate_hz, double a_max, double ep_time_s,
       step_(0),
       episode_running_(false),
       ready_for_rl_(false),
-      prev_action_(0.0),
       freq_monitor_start_time_(0.0),
       freq_monitor_step_count_(0),
       last_step_wall_time_(0.0)
@@ -70,7 +89,12 @@ PX4AccelEnv::PX4AccelEnv(double rate_hz, double a_max, double ep_time_s,
     episode_origin_ned_.fill(0.0f);
     current_global_ned_.fill(0.0f);
     current_local_ned_.fill(0.0f);
+    current_attitude_quat_ = {1.0f, 0.0f, 0.0f, 0.0f};
+    current_rpy_rad_ = {0.0f, 0.0f, 0.0f};
+    current_body_rates_rad_s_ = {0.0f, 0.0f, 0.0f};
     reset_reward_tracking();
+    std::cout << "[HZ] Requested " << requested_rate_hz_ << " Hz, capped at "
+              << rate_hz_ << " Hz." << std::endl;
 }
 
 PX4AccelEnv::~PX4AccelEnv() {
@@ -96,6 +120,7 @@ void PX4AccelEnv::reset_reward_tracking() {
     last_vy_local_ = 0.0;
     no_progress_steps_ = 0;
     vy_sign_history_.clear();
+    prev_action_norm_.assign(act_dim_, 0.0f);
 }
 
 void PX4AccelEnv::ensure_node() {
@@ -111,6 +136,94 @@ std::string PX4AccelEnv::pose_to_str(const std::array<float, 3>& ned) const {
     return std::string(buf);
 }
 
+void PX4AccelEnv::publish_rl_attitude(const std::array<float, 3>& rpy_rad,
+                                      float thrust_body_z) {
+    if (node_ == nullptr) {
+        return;
+    }
+    auto quat = euler_to_quat(rpy_rad[0], rpy_rad[1], rpy_rad[2]);
+    std::array<float, 3> thrust = {0.0f, 0.0f, thrust_body_z};
+    node_->publish_attitude_setpoint(quat, 0.0f, thrust);
+}
+
+std::array<float, 4> PX4AccelEnv::euler_to_quat(float roll, float pitch, float yaw) const {
+    float cy = std::cos(yaw * 0.5f);
+    float sy = std::sin(yaw * 0.5f);
+    float cr = std::cos(roll * 0.5f);
+    float sr = std::sin(roll * 0.5f);
+    float cp = std::cos(pitch * 0.5f);
+    float sp = std::sin(pitch * 0.5f);
+
+    std::array<float, 4> q;
+    q[0] = cy * cr * cp + sy * sr * sp;
+    q[1] = cy * sr * cp - sy * cr * sp;
+    q[2] = cy * cr * sp + sy * sr * cp;
+    q[3] = sy * cr * cp - cy * sr * sp;
+    return q;
+}
+
+std::array<float, 3> PX4AccelEnv::quat_to_euler(const std::array<float, 4>& quat) const {
+    float qw = quat[0];
+    float qx = quat[1];
+    float qy = quat[2];
+    float qz = quat[3];
+
+    float sinr_cosp = 2.0f * (qw * qx + qy * qz);
+    float cosr_cosp = 1.0f - 2.0f * (qx * qx + qy * qy);
+    float roll = std::atan2(sinr_cosp, cosr_cosp);
+
+    float sinp = 2.0f * (qw * qy - qz * qx);
+    float pitch;
+    if (std::abs(sinp) >= 1.0f) {
+        pitch = std::copysign(static_cast<float>(M_PI) / 2.0f, sinp);
+    } else {
+        pitch = std::asin(sinp);
+    }
+
+    float siny_cosp = 2.0f * (qw * qz + qx * qy);
+    float cosy_cosp = 1.0f - 2.0f * (qy * qy + qz * qz);
+    float yaw = std::atan2(siny_cosp, cosy_cosp);
+    return {roll, pitch, yaw};
+}
+
+void PX4AccelEnv::update_attitude_cache() {
+    if (node_ == nullptr) {
+        return;
+    }
+    auto att = node_->get_last_attitude();
+    if (att) {
+        for (size_t i = 0; i < 4; ++i) {
+            current_attitude_quat_[i] = att->q[i];
+        }
+        auto rpy = quat_to_euler(current_attitude_quat_);
+        current_rpy_rad_ = rpy;
+    }
+    auto ang_vel = node_->get_last_angular_velocity();
+    if (ang_vel) {
+        current_body_rates_rad_s_[0] = ang_vel->xyz[0];
+        current_body_rates_rad_s_[1] = ang_vel->xyz[1];
+        current_body_rates_rad_s_[2] = ang_vel->xyz[2];
+    }
+}
+
+bool PX4AccelEnv::attitude_unstable(float roll_deg, float pitch_deg, float yaw_rate_deg_s) const {
+    if (!enforce_attitude_limits_) {
+        return false;
+    }
+    return (std::abs(roll_deg) > unsafe_roll_deg_) ||
+           (std::abs(pitch_deg) > unsafe_pitch_deg_) ||
+           (std::abs(yaw_rate_deg_s) > unsafe_yaw_rate_deg_s_);
+}
+
+void PX4AccelEnv::initiate_safe_landing(const std::string& reason) {
+    if (node_ == nullptr) {
+        return;
+    }
+    std::cout << "[SAFETY] " << reason << std::endl;
+    node_->send_vehicle_cmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND);
+    ready_for_rl_ = false;
+}
+
 void PX4AccelEnv::disarm_and_stop() {
     if (node_ == nullptr) return;
     node_->send_vehicle_cmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0f);
@@ -121,7 +234,7 @@ torch::Tensor PX4AccelEnv::read_observation() {
     auto local = node_->get_last_local();
     if (local == nullptr) {
         // No data yet → return neutral observation
-        return torch::zeros({6}, torch::kFloat32);
+        return torch::zeros({obs_dim_}, torch::kFloat32);
     }
 
     std::array<float, 3> global_ned = {local->x, local->y, local->z};
@@ -140,13 +253,21 @@ torch::Tensor PX4AccelEnv::read_observation() {
     float vy_ned = local->vy;
     float vz_ned = local->vz;
 
-    auto obs = torch::zeros({6}, torch::kFloat32);
+    update_attitude_cache();
+
+    auto obs = torch::zeros({obs_dim_}, torch::kFloat32);
     obs[0] = current_local_ned_[0];
     obs[1] = current_local_ned_[1];
     obs[2] = current_local_ned_[2];
     obs[3] = vx_ned;
     obs[4] = vy_ned;
     obs[5] = vz_ned;
+    obs[6] = current_rpy_rad_[0];
+    obs[7] = current_rpy_rad_[1];
+    obs[8] = current_rpy_rad_[2];
+    obs[9]  = current_body_rates_rad_s_[0];
+    obs[10] = current_body_rates_rad_s_[1];
+    obs[11] = current_body_rates_rad_s_[2];
 
     return obs;
 }
@@ -267,12 +388,12 @@ bool PX4AccelEnv::arm_offboard() {
             auto local_now = node_->get_last_local();
             if (local_now != nullptr) {
                 float z_err = std::abs(local_now->z - target_z_ned);
-                if (z_err <= 0.5f) {
+                if (z_err <= 1.0f) {  // Relaxed from 0.5m to 1.0m
                     if (stable_start == std::chrono::steady_clock::time_point()) {
                         stable_start = now;
                     }
-                    if (std::chrono::duration<double>(now - stable_start).count() >= 1.0) {
-                        std::cout << "[STATE] Hover stabilized within 0.5 m for 1.0 s." << std::endl;
+                    if (std::chrono::duration<double>(now - stable_start).count() >= 0.5) {  // Reduced from 1.0s to 0.5s
+                        std::cout << "[STATE] Hover stabilized." << std::endl;
                         hover_success = true;
                         break;
                     }
@@ -280,8 +401,8 @@ bool PX4AccelEnv::arm_offboard() {
                     stable_start = std::chrono::steady_clock::time_point();
                 }
             }
-            if (std::chrono::duration<double>(now - hover_t0).count() >= 10.0) {
-                std::cout << "[WARN] Hover stabilization timeout (10 s)." << std::endl;
+            if (std::chrono::duration<double>(now - hover_t0).count() >= 15.0) {  // Increased from 10s to 15s
+                std::cout << "[WARN] Hover stabilization timeout (15 s)." << std::endl;
                 break;
             }
         }
@@ -324,6 +445,8 @@ torch::Tensor PX4AccelEnv::reset() {
     current_local_ned_.fill(0.0f);
     episode_origin_ned_.fill(0.0f);
     reset_reward_tracking();
+    std::cout << "[HZ] RL loop target " << rate_hz_ << " Hz (requested "
+              << requested_rate_hz_ << ", cap " << rate_cap_hz_ << ")." << std::endl;
 
     std::cout << "[STATE] Waiting for PX4 local position..." << std::endl;
     bool ok = node_->wait_for_local(10.0);
@@ -437,31 +560,35 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
 
     StepResult result;
 
-    // Parse action with safety checks (match Python env behavior)
+    // Parse action with safety checks
     bool fault_action = false;
     torch::Tensor action_checked;
     if (action.defined()) {
         action_checked = action.to(torch::kCPU).flatten();
     }
-    if (!action_checked.defined() || action_checked.numel() < 1) {
+    if (!action_checked.defined() || action_checked.numel() < act_dim_) {
         fault_action = true;
-        action_checked = torch::zeros({1}, torch::TensorOptions().dtype(torch::kFloat32));
+        action_checked = torch::zeros({act_dim_}, torch::TensorOptions().dtype(torch::kFloat32));
     } else {
         action_checked = action_checked.to(torch::kFloat32);
         auto invalid_mask = torch::isnan(action_checked) | torch::isinf(action_checked);
         if (invalid_mask.any().item<bool>()) {
             fault_action = true;
-            action_checked = torch::zeros_like(action_checked);
+            action_checked = torch::zeros({act_dim_}, torch::TensorOptions().dtype(torch::kFloat32));
         }
     }
     if (fault_action && safety_verbose_) {
         std::cout << "[SAFETY] Invalid or NaN action detected; substituting zero command." << std::endl;
     }
-    float raw_action = action_checked[0].item<float>();
-    float a_lat_req = std::clamp(raw_action, -static_cast<float>(a_max_), static_cast<float>(a_max_));
-    if (std::abs(raw_action) > static_cast<float>(a_max_) && safety_verbose_) {
-        std::cout << "[SAFETY] Action saturated from " << raw_action 
-                  << " to " << a_lat_req << std::endl;
+
+    std::vector<float> action_norm(act_dim_, 0.0f);
+    for (int i = 0; i < act_dim_; ++i) {
+        float raw = (i < action_checked.numel()) ? action_checked[i].item<float>() : 0.0f;
+        action_norm[i] = std::clamp(raw, -1.0f, 1.0f);
+        if (std::abs(raw) > 1.0f && safety_verbose_) {
+            std::cout << "[SAFETY] Action component " << i 
+                      << " saturated from " << raw << " to " << action_norm[i] << std::endl;
+        }
     }
 
     // Determine effective dt: use configured dt_ when >0, else measured wall-time since last step
@@ -471,36 +598,25 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
     last_step_wall_time_ = now_wall;
     double eff_dt = (dt_ > 0.0) ? dt_ : std::max(1e-4, runtime_dt);
 
-    // Apply slew rate limit using effective dt
+    // Apply slew-rate limit in normalized space
     float da_allowed = static_cast<float>(max_action_slew_rate_ * eff_dt);
-    float a_lat = std::clamp(a_lat_req, 
-                             static_cast<float>(prev_action_ - da_allowed),
-                             static_cast<float>(prev_action_ + da_allowed));
-    double slew_penalty = w_action_slew_ * std::abs(a_lat - a_lat_req);
-
-    // Publish acceleration setpoint
-    node_->publish_offboard_heartbeat(false, false, true, false, false);
-    auto lp = node_->get_last_local();
-    float a_ned_z = -9.81f;
-    bool a_z_sat = false;
-    
-    if (lp != nullptr && hover_z_ned_ != 0.0f) {
-        float z_ned = lp->z;
-        float vz_ned = lp->vz;
-        float height_up = -(z_ned - hover_z_ned_);
-        float vz_up = -vz_ned;
-        float a_up_corr = hold_kp_ * (0.0f - height_up) + hold_kd_ * (0.0f - vz_up);
-        a_ned_z = -9.81f - a_up_corr;
-        if (a_ned_z < -15.0f) {
-            a_ned_z = -15.0f;
-            a_z_sat = true;
-        } else if (a_ned_z > -5.0f) {
-            a_ned_z = -5.0f;
-            a_z_sat = true;
-        }
+    double slew_penalty = 0.0;
+    for (int i = 0; i < act_dim_; ++i) {
+        float limited = std::clamp(action_norm[i],
+                                   prev_action_norm_[i] - da_allowed,
+                                   prev_action_norm_[i] + da_allowed);
+        limited = std::clamp(limited, -1.0f, 1.0f);
+        slew_penalty += w_action_slew_ * std::abs(limited - action_norm[i]);
+        action_norm[i] = limited;
     }
-    
-    node_->publish_accel_setpoint_lat(a_lat, a_ned_z);
+
+    float ax_cmd = static_cast<float>(a_max_) * action_norm[0];
+    float ay_cmd = static_cast<float>(a_max_) * action_norm[1];
+    float az_cmd = GRAVITY + static_cast<float>(a_max_) * action_norm[2];
+    float yaw_rate_cmd = static_cast<float>(yaw_rate_limit_rad_s_) * action_norm[3];
+
+    node_->publish_offboard_heartbeat(false, false, true, false, true, false, false);
+    node_->publish_accel_setpoint(ax_cmd, ay_cmd, az_cmd, 0.0f, yaw_rate_cmd);
     rclcpp::spin_some(node_->get_node_base_interface());
     if (rate_hz_ > 0.0) {
         node_->sleep_dt();
@@ -515,6 +631,11 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
     float vx = obs[3].item<float>();
     float vy = obs[4].item<float>();
     float vz = obs[5].item<float>();
+    double roll_deg = static_cast<double>(current_rpy_rad_[0]) * RAD2DEG;
+    double pitch_deg = static_cast<double>(current_rpy_rad_[1]) * RAD2DEG;
+    double yaw_deg = static_cast<double>(current_rpy_rad_[2]) * RAD2DEG;
+    double yaw_rate_deg_s = static_cast<double>(current_body_rates_rad_s_[2]) * RAD2DEG;
+    bool attitude_fault = attitude_unstable(roll_deg, pitch_deg, yaw_rate_deg_s);
 
     // Validate observation
     bool obs_fault = false;
@@ -548,8 +669,9 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
         double elapsed = now - freq_monitor_start_time_;
         if (elapsed > 0) {
             double freq = freq_monitor_step_count_ / elapsed;
-            std::cout << "[FREQ] Control loop: " << freq << " Hz over last " 
-                      << freq_monitor_step_count_ << " steps." << std::endl;
+            std::cout << "[HZ] Control loop running at " << freq 
+                      << " Hz (target=" << rate_hz_ 
+                      << " Hz, cap=" << rate_cap_hz_ << " Hz)" << std::endl;
         }
         freq_monitor_start_time_ = now;
         freq_monitor_step_count_ = 0;
@@ -572,7 +694,11 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
     // Reward terms
     double improvement_term = w_improve_ * improvement;
     double overshoot_term = w_overshoot_ * overshoot;
-    double action_term = w_action_ * (a_lat * a_lat);
+    double action_energy = static_cast<double>(ax_cmd) * ax_cmd +
+                           static_cast<double>(ay_cmd) * ay_cmd +
+                           static_cast<double>(az_cmd - GRAVITY) * (az_cmd - GRAVITY) +
+                           static_cast<double>(yaw_rate_cmd) * yaw_rate_cmd;
+    double action_term = w_action_ * action_energy;
     double height_term = w_height_ * height_error;
     double x_drift_term = w_xdrift_ * x_drift;
 
@@ -636,6 +762,9 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
     if (stale) {
         state_fault_penalty += w_state_fault_ * 0.5;
     }
+    if (attitude_fault) {
+        state_fault_penalty += w_state_fault_;
+    }
 
     double reward = improvement_term - overshoot_term - action_term - height_term
                     - x_drift_term - backward_penalty - slew_penalty - soft_vel_penalty
@@ -659,7 +788,7 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
     last_distance_to_target_ = distance_to_target;
     last_lateral_position_ = y_m;
     last_vy_local_ = vy;
-    prev_action_ = a_lat;
+    prev_action_norm_ = action_norm;
 
     // Termination conditions
     bool terminated = false;
@@ -685,6 +814,13 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
         terminated = true;
     } else if (obs_fault) {
         std::cout << "[SAFETY] Episode terminated: invalid observation values (NaN/Inf)." << std::endl;
+        terminated = true;
+    } else if (attitude_fault) {
+        char buf[200];
+        snprintf(buf, sizeof(buf),
+                 "Unsafe attitude detected (roll=%.1f deg, pitch=%.1f deg, yaw_rate=%.1f deg/s).",
+                 roll_deg, pitch_deg, yaw_rate_deg_s);
+        initiate_safe_landing(buf);
         terminated = true;
     } else if (!node_->is_armed() || 
                node_->get_nav_state() != px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD) {
@@ -737,7 +873,14 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
     result.z_position = z_m;
     result.distance_to_target = distance_to_target;
     result.horiz_speed = horiz_speed;
-    result.a_lat = a_lat;
+    result.roll_deg = roll_deg;
+    result.pitch_deg = pitch_deg;
+    result.yaw_deg = yaw_deg;
+    result.yaw_rate_dps = yaw_rate_deg_s;
+    result.action_command = {static_cast<double>(ax_cmd),
+                             static_cast<double>(ay_cmd),
+                             static_cast<double>(az_cmd),
+                             static_cast<double>(yaw_rate_cmd)};
 
     return result;
 }

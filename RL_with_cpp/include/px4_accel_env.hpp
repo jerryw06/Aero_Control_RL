@@ -9,7 +9,7 @@
 #include <memory>
 
 struct StepResult {
-    torch::Tensor observation;  // [6]: [x, y, z, vx, vy, vz]
+    torch::Tensor observation;  // [12]: [x, y, z, vx, vy, vz, roll, pitch, yaw, p, q, r]
     double reward;
     bool terminated;
     bool truncated;
@@ -20,7 +20,11 @@ struct StepResult {
     double z_position;
     double distance_to_target;
     double horiz_speed;
-    double a_lat;
+    double roll_deg;
+    double pitch_deg;
+    double yaw_deg;
+    double yaw_rate_dps;
+    std::array<double, 4> action_command;  // [ax, ay, az, yaw_rate]
 };
 
 class PX4AccelEnv {
@@ -48,6 +52,8 @@ public:
     // Accessors
     int get_max_steps() const { return max_steps_; }
     double get_episode_reward_sum() const { return episode_reward_sum_; }
+    int get_observation_dim() const { return obs_dim_; }
+    int get_action_dim() const { return act_dim_; }
 
 private:
     // Helper methods
@@ -55,12 +61,21 @@ private:
     void disarm_and_stop();
     torch::Tensor read_observation();
     bool arm_offboard();
+    void publish_rl_attitude(const std::array<float, 3>& rpy_rad,
+                             float thrust_body_z);
+    std::array<float, 4> euler_to_quat(float roll, float pitch, float yaw) const;
+    std::array<float, 3> quat_to_euler(const std::array<float, 4>& quat) const;
+    void update_attitude_cache();
+    bool attitude_unstable(float roll_deg, float pitch_deg, float yaw_rate_deg_s) const;
+    void initiate_safe_landing(const std::string& reason);
     void reset_reward_tracking();
     std::string pose_to_str(const std::array<float, 3>& ned) const;
     bool wait_until_grounded(double timeout_s = 10.0, double vz_tol = 0.15, double stable_s = 1.0);
 
     // Configuration
     double rate_hz_;
+    double requested_rate_hz_;
+    double rate_cap_hz_;
     double dt_;
     double a_max_;
     int max_steps_;
@@ -102,6 +117,17 @@ private:
     int oscillation_window_;
     int oscillation_flips_;
     double max_action_slew_rate_;
+    double roll_limit_deg_;
+    double pitch_limit_deg_;
+    double yaw_limit_deg_;
+    double unsafe_roll_deg_;
+    double unsafe_pitch_deg_;
+    double unsafe_yaw_rate_deg_s_;
+    double yaw_rate_limit_deg_s_;
+    double yaw_rate_limit_rad_s_;
+    int obs_dim_;
+    int act_dim_;
+    bool enforce_attitude_limits_;
 
     // PD gains for altitude hold
     double hold_kp_;
@@ -114,6 +140,9 @@ private:
     std::array<float, 3> episode_origin_ned_;
     std::array<float, 3> current_global_ned_;
     std::array<float, 3> current_local_ned_;
+    std::array<float, 4> current_attitude_quat_;
+    std::array<float, 3> current_rpy_rad_;
+    std::array<float, 3> current_body_rates_rad_s_;
     float hover_z_ned_;
     
     int step_;
@@ -140,7 +169,7 @@ private:
     double last_vy_local_;
     int no_progress_steps_;
     std::deque<double> vy_sign_history_;
-    double prev_action_;
+    std::vector<float> prev_action_norm_;
     
     // Frequency monitor
     double freq_monitor_start_time_;

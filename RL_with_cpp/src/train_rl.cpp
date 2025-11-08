@@ -30,11 +30,12 @@ int main(int argc, char** argv) {
         std::cout << "=== C++ RL Training for PX4 Lateral Acceleration Control ===" << std::endl;
         
         // Match Python env configuration
-    // Fixed control/observation rate (re-enable pacing)
-    PX4AccelEnv env(100.0, 3.0, 6.0, 2.0, 2.0);
+        PX4AccelEnv env(200.0, 3.0, 6.0, 2.0, 2.0);
+        const int obs_dim = env.get_observation_dim();
+        const int act_dim = env.get_action_dim();
         
-        // Create policy network (matching Python: 6D obs, 1024 hidden, 8 layers)
-        Policy policy(6, 1024, 8, 3.0);
+        // Create policy network (1024 hidden, 8 layers)
+        Policy policy(obs_dim, 1024, 8, 1.0, act_dim);
         
         // Optimizer with adaptive learning rate
         torch::optim::Adam optimizer(policy->parameters(), torch::optim::AdamOptions(3e-3));

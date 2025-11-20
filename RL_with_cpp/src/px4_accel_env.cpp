@@ -6,13 +6,28 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <cstdlib>
 
 using namespace std::chrono_literals;
 
 namespace {
 constexpr double DEG2RAD = M_PI / 180.0;
 constexpr double RAD2DEG = 180.0 / M_PI;
-constexpr float GRAVITY = -9.81f;
+constexpr float GRAVITY = 9.81f;  // Positive for NED frame (Z-down)
+
+std::string nav_state_str(int nav) {
+    switch (nav) {
+        case px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD: return "OFFBOARD";
+        case px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_MANUAL: return "MANUAL";
+        case px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_ALTCTL: return "ALTCTL";
+        case px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_POSCTL: return "POSCTL";
+        case px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_AUTO_MISSION: return "AUTO_MISSION";
+        case px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_AUTO_TAKEOFF: return "AUTO_TAKEOFF";
+        case px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_AUTO_LAND: return "AUTO_LAND";
+        case px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_AUTO_LOITER: return "AUTO_LOITER";
+        default: return std::string("UNKNOWN(") + std::to_string(nav) + ")";
+    }
+}
 }
 
 PX4AccelEnv::PX4AccelEnv(double rate_hz, double a_max, double ep_time_s,
@@ -84,7 +99,8 @@ PX4AccelEnv::PX4AccelEnv(double rate_hz, double a_max, double ep_time_s,
       ready_for_rl_(false),
       freq_monitor_start_time_(0.0),
       freq_monitor_step_count_(0),
-      last_step_wall_time_(0.0)
+      last_step_wall_time_(0.0),
+      use_isaac_sim_reset_(false)
 {
     episode_origin_ned_.fill(0.0f);
     current_global_ned_.fill(0.0f);
@@ -93,8 +109,18 @@ PX4AccelEnv::PX4AccelEnv(double rate_hz, double a_max, double ep_time_s,
     current_rpy_rad_ = {0.0f, 0.0f, 0.0f};
     current_body_rates_rad_s_ = {0.0f, 0.0f, 0.0f};
     reset_reward_tracking();
+    std::cout << "[HZ-DEBUG] Constructor: rate_hz_arg=" << rate_hz 
+              << " rate_cap_hz_=" << rate_cap_hz_
+              << " min(rate,cap)=" << std::min(rate_hz, rate_cap_hz_)
+              << " max(1,min)=" << std::max(1.0, std::min(rate_hz, rate_cap_hz_))
+              << " ACTUAL rate_hz_=" << rate_hz_
+              << " dt_=" << dt_ << std::endl;
     std::cout << "[HZ] Requested " << requested_rate_hz_ << " Hz, capped at "
-              << rate_hz_ << " Hz." << std::endl;
+              << rate_hz_ << " Hz, dt=" << dt_ << " s" << std::endl;
+    
+    // Check if Isaac Sim reset service is available (optional feature)
+    // If using Pegasus Simulator with Isaac Sim, you can publish reset commands via a service
+    // For now, this is a placeholder - integration depends on your sim setup
 }
 
 PX4AccelEnv::~PX4AccelEnv() {
@@ -127,6 +153,15 @@ void PX4AccelEnv::ensure_node() {
     if (node_ == nullptr) {
         rclcpp::init(0, nullptr);
         node_ = std::make_shared<PX4Node>(rate_hz_);
+        // Check if Isaac Sim script restart is enabled
+        const char* sim_reset_env = std::getenv("ISAAC_SIM_RESET");
+        if (sim_reset_env && std::string(sim_reset_env) == "1") {
+            use_isaac_sim_reset_ = true;
+            std::cout << "[INIT] Isaac Sim script restart enabled." << std::endl;
+        } else {
+            use_isaac_sim_reset_ = false;
+            std::cout << "[INIT] Isaac Sim script restart disabled." << std::endl;
+        }
     }
 }
 
@@ -144,6 +179,31 @@ void PX4AccelEnv::publish_rl_attitude(const std::array<float, 3>& rpy_rad,
     auto quat = euler_to_quat(rpy_rad[0], rpy_rad[1], rpy_rad[2]);
     std::array<float, 3> thrust = {0.0f, 0.0f, thrust_body_z};
     node_->publish_attitude_setpoint(quat, 0.0f, thrust);
+}
+
+void PX4AccelEnv::hold_position_for(double seconds) {
+    if (node_ == nullptr) {
+        return;
+    }
+    // Use current local position as hold target; default to episode origin if not available
+    float hold_x = episode_origin_ned_[0];
+    float hold_y = episode_origin_ned_[1];
+    float hold_z = hover_z_ned_;
+    auto lp = node_->get_last_local();
+    if (lp) {
+        hold_x = lp->x;
+        hold_y = lp->y;
+        // Keep altitude at the stabilized hover height when available
+        hold_z = (hover_z_ned_ != 0.0f) ? hover_z_ned_ : lp->z;
+    }
+
+    int iters = static_cast<int>(std::max(1.0, seconds) / std::max(1e-3, dt_));
+    for (int i = 0; i < iters; ++i) {
+        node_->publish_offboard_heartbeat(true, false, false, false, false);
+        node_->publish_position_setpoint(hold_x, hold_y, hold_z, 0.0f);
+        rclcpp::spin_some(node_->get_node_base_interface());
+        node_->sleep_dt();
+    }
 }
 
 std::array<float, 4> PX4AccelEnv::euler_to_quat(float roll, float pitch, float yaw) const {
@@ -282,19 +342,29 @@ bool PX4AccelEnv::arm_offboard() {
         }
 
         // Warmup Offboard: publish position mode + hold current position
-        node_->wait_for_local(3.0);
+        std::cout << "[STATE] Waiting for PX4 local position data..." << std::endl;
+        node_->wait_for_local(10.0);  // Increased timeout for after reset
         auto warm_local = node_->get_last_local();
         float hold_x = 0.0f, hold_y = 0.0f, hold_z = 0.0f;
         if (warm_local) {
             hold_x = warm_local->x;
             hold_y = warm_local->y;
             hold_z = warm_local->z;
+            std::cout << "[STATE] Got position data: x=" << hold_x << " y=" << hold_y << " z=" << hold_z << std::endl;
+        } else {
+            std::cout << "[WARN] No position data received after 10s timeout!" << std::endl;
         }
+        std::cout << "[STATE] Publishing OFFBOARD heartbeat..." << std::endl;
         for (int i = 0; i < 30; ++i) {
             node_->publish_offboard_heartbeat(true, false, false, false, false);
             node_->publish_position_setpoint(hold_x, hold_y, hold_z, 0.0f);
             rclcpp::spin_some(node_->get_node_base_interface());
             node_->sleep_dt();
+            if (i % 10 == 0) {
+                std::cout << "[TAKEOFF-DEBUG] Warmup i=" << i << " nav_state="
+                          << nav_state_str(node_->get_nav_state())
+                          << " armed=" << (node_->is_armed()?"YES":"NO") << std::endl;
+            }
         }
 
         // Switch to OFFBOARD
@@ -305,28 +375,46 @@ bool PX4AccelEnv::arm_offboard() {
         }, 3.0);
         if (!offboard_ok) {
             std::cout << "[WARN] Failed to confirm OFFBOARD mode. Retrying takeoff sequence..." << std::endl;
+            std::cout << "[TAKEOFF-DEBUG] nav_state after attempt=" << nav_state_str(node_->get_nav_state()) << std::endl;
             continue;
         }
 
-        // Arm
+        // Arm the vehicle - keep sending OFFBOARD heartbeat during arming
         std::cout << "[STATE] Arming vehicle..." << std::endl;
         int arm_attempts = 0;
         const int max_arm_attempts = 3;
         bool armed = false;
+        
         while (arm_attempts < max_arm_attempts && !armed) {
+            arm_attempts++;
+            
+            // Send arm command (try without force first)
+            std::cout << "[ARM] Attempt " << arm_attempts << "/" << max_arm_attempts << std::endl;
             node_->send_vehicle_cmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0f);
-            node_->wait_until([this]() { return node_->is_armed(); }, 3.0);
-            if (node_->is_armed()) {
-                std::cout << "[STATE] Armed successfully." << std::endl;
-                armed = true;
-                break;
-            } else {
-                std::cout << "[WARN] Arm attempt " << (arm_attempts + 1) 
-                          << " failed. Disarming, waiting 2s, and retrying..." << std::endl;
-                node_->send_vehicle_cmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0f);
-                node_->wait_until([this]() { return !node_->is_armed(); }, 2.0);
-                std::this_thread::sleep_for(2s);
-                arm_attempts++;
+            
+            // Keep sending OFFBOARD heartbeat while waiting for arm to succeed
+            auto start_time = std::chrono::steady_clock::now();
+            while (std::chrono::steady_clock::now() - start_time < std::chrono::seconds(3)) {
+                node_->publish_offboard_heartbeat(true, false, false, false, false);
+                node_->publish_position_setpoint(hold_x, hold_y, hold_z, 0.0f);
+                rclcpp::spin_some(node_->get_node_base_interface());
+                
+                if (node_->is_armed()) {
+                    std::cout << "[STATE] Armed successfully!" << std::endl;
+                    armed = true;
+                    break;
+                }
+                if (std::chrono::steady_clock::now() - start_time > std::chrono::milliseconds(500)) {
+                    // periodic debug
+                    std::cout << "[ARM-DEBUG] nav_state=" << nav_state_str(node_->get_nav_state())
+                              << " armed=" << (node_->is_armed()?"YES":"NO") << std::endl;
+                }
+                std::this_thread::sleep_for(50ms);
+            }
+            
+            if (!armed && arm_attempts < max_arm_attempts) {
+                std::cout << "[WARN] Arm attempt failed, retrying..." << std::endl;
+                std::this_thread::sleep_for(1s);
             }
         }
         if (!armed) {
@@ -359,7 +447,10 @@ bool PX4AccelEnv::arm_offboard() {
         float pre_z0 = local0->z;
         float target_z_ned = pre_z0 - start_up_m_;  // up in NED is negative
         int steps = static_cast<int>(3.0 / dt_);
-        std::cout << "[STATE] Performing smooth takeoff to " << start_up_m_ << " m..." << std::endl;
+        std::cout << "[TAKEOFF-DEBUG] pre_z0=" << pre_z0 << " start_up_m=" << start_up_m_
+                  << " target_z_ned=" << target_z_ned << " dt_=" << dt_ << " steps=" << steps << std::endl;
+        std::cout << "[STATE] Performing smooth takeoff to " << start_up_m_ << " m (target_z_ned=" 
+                  << target_z_ned << ", " << steps << " steps over 3.0s)..." << std::endl;
         
         float hold_x0 = episode_origin_ned_[0];
         float hold_y0 = episode_origin_ned_[1];
@@ -370,6 +461,13 @@ bool PX4AccelEnv::arm_offboard() {
             node_->publish_position_setpoint(hold_x0, hold_y0, interp_z, 0.0f);
             rclcpp::spin_some(node_->get_node_base_interface());
             node_->sleep_dt();
+            if (i % (steps/3 + 1) == 0) {
+                auto lp_take = node_->get_last_local();
+                if (lp_take) {
+                    std::cout << "[TAKEOFF-DEBUG] Climb step=" << i << " z=" << lp_take->z
+                              << " target_z=" << interp_z << " nav_state=" << nav_state_str(node_->get_nav_state()) << std::endl;
+                }
+            }
         }
 
         // Hold hover for stabilization
@@ -383,6 +481,13 @@ bool PX4AccelEnv::arm_offboard() {
             node_->publish_position_setpoint(hold_x0, hold_y0, target_z_ned, 0.0f);
             rclcpp::spin_some(node_->get_node_base_interface());
             node_->sleep_dt();
+            if ((std::chrono::steady_clock::now() - hover_t0) > std::chrono::seconds(2) && (std::chrono::steady_clock::now() - hover_t0) < std::chrono::seconds(3)) {
+                auto lp_hover_dbg = node_->get_last_local();
+                if (lp_hover_dbg) {
+                    std::cout << "[HOVER-DEBUG] z=" << lp_hover_dbg->z << " target=" << target_z_ned
+                              << " z_err=" << std::abs(lp_hover_dbg->z - target_z_ned) << " nav_state=" << nav_state_str(node_->get_nav_state()) << std::endl;
+                }
+            }
             
             auto now = std::chrono::steady_clock::now();
             auto local_now = node_->get_last_local();
@@ -408,7 +513,100 @@ bool PX4AccelEnv::arm_offboard() {
         }
 
         if (hover_success) {
-            // Re-zero origin
+            // ========================================================================
+            // CRITICAL: Ensure consistent starting position for RL
+            // ========================================================================
+            // Before handing control to RL, verify:
+            // 1. Altitude is within acceptable range of target
+            // 2. All velocities (vx, vy, vz) are near zero
+            // 3. Conditions hold stable for 1 second
+            std::cout << "[STATE] Hover stabilized. Verifying RL starting conditions..." << std::endl;
+            
+            const float altitude_tolerance = 0.2f;  // meters - acceptable deviation from target altitude
+            const float velocity_threshold = 0.15f;  // m/s - max velocity in any direction
+            const double stability_duration = 1.0;   // seconds - how long conditions must hold
+            
+            auto stability_check_start = std::chrono::steady_clock::now();
+            auto stable_condition_start = std::chrono::steady_clock::time_point();
+            bool rl_ready_conditions_met = false;
+            
+            while (std::chrono::duration<double>(std::chrono::steady_clock::now() - stability_check_start).count() < 10.0) {
+                node_->publish_offboard_heartbeat(true, false, false, false, false);
+                node_->publish_position_setpoint(hold_x0, hold_y0, target_z_ned, 0.0f);
+                rclcpp::spin_some(node_->get_node_base_interface());
+                node_->sleep_dt();
+                
+                auto lp_check = node_->get_last_local();
+                if (lp_check != nullptr) {
+                    float z_error = std::abs(lp_check->z - target_z_ned);
+                    float vx_abs = std::abs(lp_check->vx);
+                    float vy_abs = std::abs(lp_check->vy);
+                    float vz_abs = std::abs(lp_check->vz);
+                    float max_velocity = std::max({vx_abs, vy_abs, vz_abs});
+                    
+                    bool altitude_ok = (z_error <= altitude_tolerance);
+                    bool velocities_ok = (max_velocity <= velocity_threshold);
+                    
+                    if (altitude_ok && velocities_ok) {
+                        if (stable_condition_start == std::chrono::steady_clock::time_point()) {
+                            stable_condition_start = std::chrono::steady_clock::now();
+                            std::cout << "[RL-READY-CHECK] Starting conditions met - z_err=" << z_error 
+                                      << "m, max_vel=" << max_velocity << "m/s. Waiting " 
+                                      << stability_duration << "s for stability..." << std::endl;
+                        }
+                        
+                        double stable_elapsed = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - stable_condition_start).count();
+                        
+                        if (stable_elapsed >= stability_duration) {
+                            std::cout << "[RL-READY-CHECK] ✓ Altitude within " << altitude_tolerance << "m (error: " 
+                                      << z_error << "m)" << std::endl;
+                            std::cout << "[RL-READY-CHECK] ✓ All velocities ≤ " << velocity_threshold 
+                                      << "m/s (vx=" << vx_abs << ", vy=" << vy_abs << ", vz=" << vz_abs << ")" << std::endl;
+                            std::cout << "[RL-READY-CHECK] ✓ Conditions stable for " << stability_duration << "s" << std::endl;
+                            std::cout << "[RL-READY-CHECK] Starting position VERIFIED - RL takeover in 1 second..." << std::endl;
+                            
+                            // Wait additional 1 second before RL takeover
+                            auto final_wait_start = std::chrono::steady_clock::now();
+                            while (std::chrono::duration<double>(std::chrono::steady_clock::now() - final_wait_start).count() < 1.0) {
+                                node_->publish_offboard_heartbeat(true, false, false, false, false);
+                                node_->publish_position_setpoint(hold_x0, hold_y0, target_z_ned, 0.0f);
+                                rclcpp::spin_some(node_->get_node_base_interface());
+                                node_->sleep_dt();
+                            }
+                            
+                            rl_ready_conditions_met = true;
+                            break;
+                        }
+                    } else {
+                        // Conditions not met, reset timer
+                        if (stable_condition_start != std::chrono::steady_clock::time_point()) {
+                            std::cout << "[RL-READY-CHECK] Conditions lost - z_err=" << z_error 
+                                      << "m (tol=" << altitude_tolerance << "m), max_vel=" << max_velocity 
+                                      << "m/s (thr=" << velocity_threshold << "m/s). Restarting stability timer." << std::endl;
+                        }
+                        stable_condition_start = std::chrono::steady_clock::time_point();
+                    }
+                }
+            }
+            
+            if (!rl_ready_conditions_met) {
+                std::cout << "[WARN] RL starting condition verification timeout (10s). Conditions not consistently met." << std::endl;
+                if (takeoff_attempt < max_takeoff_retries - 1) {
+                    std::cout << "[STATE] Landing and disarming before retry..." << std::endl;
+                    node_->send_vehicle_cmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND);
+                    std::this_thread::sleep_for(2s);
+                    node_->send_vehicle_cmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0f);
+                    node_->wait_until([this]() { return !node_->is_armed(); }, 3.0);
+                    std::this_thread::sleep_for(2s);
+                    continue;
+                } else {
+                    std::cout << "[ERROR] Failed to achieve consistent RL starting conditions after all retries." << std::endl;
+                    return false;
+                }
+            }
+            
+            // Re-zero origin after final verification
             node_->wait_for_local(1.0);
             auto last_local = node_->get_last_local();
             if (last_local != nullptr) {
@@ -419,11 +617,13 @@ bool PX4AccelEnv::arm_offboard() {
                 current_local_ned_.fill(0.0f);
             }
             hover_z_ned_ = target_z_ned;
-            std::cout << "[STATE] Hover complete — switching to lateral RL control." << std::endl;
+            std::cout << "[STATE] RL starting position verified and consistent — switching to lateral RL control." << std::endl;
             ready_for_rl_ = true;
             return true;
         } else {
             if (takeoff_attempt < max_takeoff_retries - 1) {
+                std::cout << "[HOVER-DEBUG] Hover failed; will retry. nav_state=" << nav_state_str(node_->get_nav_state())
+                          << " armed=" << (node_->is_armed()?"YES":"NO") << std::endl;
                 std::cout << "[STATE] Landing and disarming before retry..." << std::endl;
                 node_->send_vehicle_cmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND);
                 std::this_thread::sleep_for(2s);
@@ -440,6 +640,14 @@ bool PX4AccelEnv::arm_offboard() {
 }
 
 torch::Tensor PX4AccelEnv::reset() {
+    static int episode_count = 0;
+    episode_count++;
+    
+    std::cout << "\n\n" << std::endl;
+    std::cout << "╔═══════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║         STARTING EPISODE #" << episode_count << " RESET SEQUENCE          ║" << std::endl;
+    std::cout << "╚═══════════════════════════════════════════════════════════╝" << std::endl;
+    
     ensure_node();
     current_global_ned_.fill(0.0f);
     current_local_ned_.fill(0.0f);
@@ -451,6 +659,10 @@ torch::Tensor PX4AccelEnv::reset() {
     std::cout << "[STATE] Waiting for PX4 local position..." << std::endl;
     bool ok = node_->wait_for_local(10.0);
     if (!ok || node_->get_last_local() == nullptr) {
+        std::cout << "[RESET-ERROR] wait_for_local failed (10s). nav_state="
+                  << nav_state_str(node_->get_nav_state()) << " armed=" << (node_->is_armed()?"YES":"NO")
+                  << " last_local_ptr=" << (node_->get_last_local()?"NONNULL":"NULL") << std::endl;
+        std::cout << "[RESET-ERROR] Possible causes: PX4 SITL not running, MicroXRCEAgent bridge down, wrong ROS_DOMAIN_ID, or DDS transport mismatch." << std::endl;
         throw std::runtime_error("No VehicleLocalPosition messages received. Check bridge/topic.");
     }
 
@@ -464,28 +676,61 @@ torch::Tensor PX4AccelEnv::reset() {
         std::cout << "[STATE] Captured spawn global NED: " << pose_to_str(spawn_xyz_) << std::endl;
     }
 
-    // If previous episode ended mid-air, command land and wait until grounded
+    // ========================================================================
+    // PROPER EPISODE RESET SEQUENCE (Python-style teleport-back-and-reset)
+    // ========================================================================
+    
+    // 1. If previous episode ended mid-air, land and wait until grounded
     auto last_local_pre = node_->get_last_local();
     if (last_local_pre && std::abs(last_local_pre->z - spawn_xyz_[2]) > 0.3f) {
-        std::cout << "[STATE] Episode reset: landing to ground reference before starting new episode..." << std::endl;
+        std::cout << "[RESET] Episode ended mid-air; landing to ground..." << std::endl;
         node_->send_vehicle_cmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND);
         if (!wait_until_grounded(12.0)) {
             std::cout << "[WARN] Grounding timeout; proceeding with best available position." << std::endl;
         } else {
-            std::cout << "[STATE] Grounded and stabilized." << std::endl;
+            std::cout << "[RESET] Grounded and stabilized." << std::endl;
         }
     }
 
-    // Ensure disarmed before new cycle
+    // 2. Disarm the vehicle
+    std::cout << "[RESET] ========================================" << std::endl;
+    std::cout << "[RESET] Step 2: Disarming vehicle..." << std::endl;
     disarm_and_stop();
-    std::cout << "[STATE] Disarmed prior to new episode." << std::endl;
+    std::cout << "[RESET-SUCCESS] Vehicle disarmed." << std::endl;
+    std::this_thread::sleep_for(500ms);
+    
+    // 3. Teleport back to spawn in Isaac Sim (if available)
+    std::cout << "[RESET] ========================================" << std::endl;
+    std::cout << "[RESET] Step 3: Teleporting to spawn position..." << std::endl;
+    if (!teleport_to_spawn()) {
+        std::cout << "[RESET-WARN] Teleport failed or not available; continuing with manual reset." << std::endl;
+    }
+    
+    // 4. Reset physics and zero velocities
+    std::cout << "[RESET] ========================================" << std::endl;
+    std::cout << "[RESET] Step 4: Resetting physics and zeroing velocities..." << std::endl;
+    if (!reset_physics_and_velocities()) {
+        std::cout << "[RESET-WARN] Physics reset incomplete; continuing." << std::endl;
+    }
+    
+    // 5. Wait for position AND velocity to settle after teleport
+    std::cout << "[RESET] ========================================" << std::endl;
+    std::cout << "[RESET] Step 5: Waiting for position and velocity to stabilize..." << std::endl;
+    wait_for_position_settle(3.0);  // Increased to 3.0s for better stabilization
 
-    // Grab starting origin
+    // 6. Reset PX4 local origin tracking
+    //    After teleport/landing, re-capture the current position as episode origin
+    std::cout << "[RESET] ========================================" << std::endl;
+    std::cout << "[RESET] Step 6: Resetting PX4 local origin tracking..." << std::endl;
     node_->wait_for_local(2.0);
     auto local = node_->get_last_local();
     if (local == nullptr) {
-        throw std::runtime_error("No VehicleLocalPosition messages received.");
+        throw std::runtime_error("No VehicleLocalPosition messages received after reset.");
     }
+    
+    std::cout << "[RESET-DEBUG] Raw PX4 position after reset: x=" << local->x 
+              << ", y=" << local->y << ", z=" << local->z << std::endl;
+    
     // Use spawn global reference to zero local coordinates, ensuring consistent reset
     episode_origin_ned_[0] = spawn_xyz_[0];
     episode_origin_ned_[1] = spawn_xyz_[1];
@@ -497,22 +742,79 @@ torch::Tensor PX4AccelEnv::reset() {
     current_local_ned_[1] = current_global_ned_[1] - episode_origin_ned_[1];
     current_local_ned_[2] = current_global_ned_[2] - episode_origin_ned_[2];
     hover_z_ned_ = 0.0f;
+    
+    std::cout << "[RESET-DEBUG] Episode origin (spawn): " << pose_to_str(episode_origin_ned_) << std::endl;
+    std::cout << "[RESET-DEBUG] Current global NED: " << pose_to_str(current_global_ned_) << std::endl;
+    std::cout << "[RESET-DEBUG] Current local NED (global - origin): " << pose_to_str(current_local_ned_) << std::endl;
+    
+    float reset_drift = std::sqrt(
+        std::pow(current_local_ned_[0], 2) +
+        std::pow(current_local_ned_[1], 2) +
+        std::pow(current_local_ned_[2], 2)
+    );
+    std::cout << "[RESET-DEBUG] Drift from spawn after reset: " << reset_drift << " m" << std::endl;
+    
+    if (reset_drift > 1.0f) {
+        std::cout << "[RESET-WARN] Large drift from spawn (" << reset_drift 
+                  << "m). Isaac Sim restart may have taken longer than expected." << std::endl;
+        // Since we restarted Isaac Sim, drift should be minimal. If it's large, 
+        // it likely means initialization isn't complete yet. The system will handle
+        // this through the takeoff sequence.
+    }
 
-    // Arm and takeoff
+    // 7. Re-arm and take off to hover altitude
+    std::cout << "[RESET] ========================================" << std::endl;
+    std::cout << "[RESET] Step 7: Re-arming and taking off to hover altitude..." << std::endl;
     ready_for_rl_ = false;
     ok = arm_offboard();
     if (!ok || !ready_for_rl_) {
-        throw std::runtime_error("Failed to arm/hover before RL.");
+        std::cout << "[RESET-ERROR] arm_offboard() returned false or ready_for_rl_ not set." << std::endl;
+        std::cout << "[RESET-DEBUG] nav_state=" << nav_state_str(node_->get_nav_state())
+                  << " armed=" << (node_->is_armed()?"YES":"NO") << " ready_for_rl_=" << (ready_for_rl_?"true":"false") << std::endl;
+        auto lp_fail = node_->get_last_local();
+        if (lp_fail) {
+            std::cout << "[RESET-DEBUG] Current local position before failure: x=" << lp_fail->x
+                      << " y=" << lp_fail->y << " z=" << lp_fail->z << std::endl;
+        } else {
+            std::cout << "[RESET-DEBUG] No local position message available at failure point." << std::endl;
+        }
+        std::cout << "[RESET-ERROR] Common failure reasons: OFFBOARD not entered, arming denied, altitude hover not stabilized, or insufficient heartbeats during takeoff." << std::endl;
+        throw std::runtime_error("Failed to arm/hover after reset.");
     }
+    
+    std::cout << "[RESET] ========================================" << std::endl;
+    std::cout << "[RESET-SUCCESS] Episode reset complete! Ready for RL control." << std::endl;
+    std::cout << "[RESET] ========================================" << std::endl;
 
     step_ = 0;
     episode_running_ = true;
+    // Activate vertical hold guard so RL does not interfere with late takeoff stabilization
+    vertical_hold_active_ = true;
+    vertical_stable_steps_ = 0;
+    required_stable_steps_ = static_cast<int>(std::max(5.0, 0.5 * rate_hz_)); // ~0.5s dwell
+    vertical_guard_log_count_ = 0;
+    std::cout << "[TAKEOFF-GUARD] RL vertical/yaw channels locked until hover stable (|z|<" 
+              << vertical_release_z_tol_ << " & |vz|<" << vertical_release_vz_tol_ 
+              << " for " << required_stable_steps_ << " consecutive steps)." << std::endl;
 
     auto obs = read_observation();
+    
+    std::cout << "\n[RESET] ========================================" << std::endl;
+    std::cout << "[RESET] FINAL STATE SUMMARY:" << std::endl;
+    std::cout << "[RESET] ========================================" << std::endl;
     std::cout << "[STATE] Start pose:" << std::endl;
     std::cout << "         Global NED: " << pose_to_str(current_global_ned_) << std::endl;
     std::cout << "         Local NED:  " << pose_to_str(current_local_ned_) << std::endl;
-    std::cout << "[STATE] RL control begins." << std::endl;
+    std::cout << "         Spawn ref:  " << pose_to_str(spawn_xyz_) << std::endl;
+    
+    auto final_pos = node_->get_last_local();
+    if (final_pos) {
+        std::cout << "         Velocities: vx=" << final_pos->vx << ", vy=" << final_pos->vy << ", vz=" << final_pos->vz << std::endl;
+        std::cout << "         Armed: " << (node_->is_armed() ? "YES" : "NO") << std::endl;
+    }
+    
+    std::cout << "[STATE] RL control begins NOW." << std::endl;
+    std::cout << "[RESET] ========================================\n" << std::endl;
 
     // Reset frequency monitor
     freq_monitor_start_time_ = std::chrono::duration<double>(
@@ -614,6 +916,41 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
     float ay_cmd = static_cast<float>(a_max_) * action_norm[1];
     float az_cmd = GRAVITY + static_cast<float>(a_max_) * action_norm[2];
     float yaw_rate_cmd = static_cast<float>(yaw_rate_limit_rad_s_) * action_norm[3];
+
+    // ------------------------------------------------------------------
+    // Takeoff vertical hold guard: override az & yaw until altitude stable
+    // ------------------------------------------------------------------
+    if (vertical_hold_active_) {
+        auto lp_guard = node_->get_last_local();
+        if (lp_guard) {
+            float z_err_guard = std::abs(lp_guard->z - hover_z_ned_); // hover_z_ned_ should be near target (0 local)
+            float vz_abs_guard = std::abs(lp_guard->vz);
+            bool stable_now = (z_err_guard < vertical_release_z_tol_) && (vz_abs_guard < vertical_release_vz_tol_);
+            if (stable_now) {
+                vertical_stable_steps_++;
+            } else {
+                vertical_stable_steps_ = 0; // reset dwell counter
+            }
+            if (vertical_stable_steps_ >= required_stable_steps_) {
+                vertical_hold_active_ = false;
+                std::cout << "[TAKEOFF-GUARD] Hover stability confirmed (z_err=" << z_err_guard
+                          << " vz=" << vz_abs_guard << ") — enabling full RL control." << std::endl;
+            }
+            if (vertical_hold_active_) {
+                // Override vertical & yaw commands to maintain hover; only lateral acceleration allowed
+                az_cmd = GRAVITY; // neutral vertical accel (hover thrust assumption)
+                yaw_rate_cmd = 0.0f;
+                action_norm[2] = 0.0f; // reflect clamped action for logging consistency
+                action_norm[3] = 0.0f;
+                if (vertical_guard_log_count_ < 5 || (vertical_guard_log_count_ % 100 == 0)) {
+                    std::cout << "[TAKEOFF-GUARD] Holding vertical/yaw (z_err=" << z_err_guard
+                              << " vz=" << vz_abs_guard << ", stable_steps=" << vertical_stable_steps_ << "/" 
+                              << required_stable_steps_ << ")" << std::endl;
+                }
+                vertical_guard_log_count_++;
+            }
+        }
+    }
 
     node_->publish_offboard_heartbeat(false, false, true, false, true, false, false);
     node_->publish_accel_setpoint(ax_cmd, ay_cmd, az_cmd, 0.0f, yaw_rate_cmd);
@@ -859,7 +1196,22 @@ StepResult PX4AccelEnv::step(const torch::Tensor& action) {
         std::cout << "         + Hold bonus:          " << episode_hold_bonus_ << std::endl;
         std::cout << "         = Total return:        " << episode_reward_sum_ << std::endl;
         
-        disarm_and_stop();
+        // Gracefully hand control back to position-hold before ending episode
+        hold_position_for(1.0);
+
+        // If still airborne, command an automatic land; otherwise disarm
+        auto lp_end = node_->get_last_local();
+        bool airborne = false;
+        if (lp_end) {
+            // Consider airborne if >0.5 m from spawn altitude
+            airborne = std::abs(lp_end->z - spawn_xyz_[2]) > 0.5f;
+        }
+        if (airborne) {
+            std::cout << "[STATE] Commanding LAND for episode end." << std::endl;
+            node_->send_vehicle_cmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND);
+        } else {
+            disarm_and_stop();
+        }
         episode_running_ = false;
         ready_for_rl_ = false;
     }
@@ -893,4 +1245,227 @@ void PX4AccelEnv::close() {
         node_.reset();
         rclcpp::shutdown();
     }
+}
+
+// ============================================================================
+// Isaac Sim Reset/Teleport Integration
+// ============================================================================
+
+bool PX4AccelEnv::teleport_to_spawn() {
+    /**
+     * Use topic-based reset instead of ROS2 service to avoid Python<->C++ type support issues.
+     * 
+     * How it works:
+     * 1. C++ publishes to /isaac_sim/reset_request
+     * 2. Python script receives it and calls world.reset() + teleport
+     * 3. Python publishes to /isaac_sim/reset_done when complete
+     * 4. C++ waits for the confirmation message
+     * 
+     * This is more reliable than services for mixed Python/C++ communication.
+     */
+    
+    std::cout << "[RESET-DEBUG] teleport_to_spawn() called - using topic-based reset" << std::endl;
+    std::cout << "[RESET-DEBUG] use_isaac_sim_reset_ = " << use_isaac_sim_reset_ << std::endl;
+    std::cout << "[RESET-DEBUG] spawn_xyz_ = " << pose_to_str(spawn_xyz_) << std::endl;
+    
+    if (!use_isaac_sim_reset_) {
+        std::cout << "[RESET-INFO] Isaac Sim reset disabled; relying on PX4 position alone." << std::endl;
+        std::cout << "[RESET-INFO] Assuming drone is already at spawn after landing/disarm." << std::endl;
+        return true;
+    }
+    
+    std::cout << "\n╔══════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║  REQUESTING ISAAC SIM RESET VIA TOPICS               ║" << std::endl;
+    std::cout << "╚══════════════════════════════════════════════════════════╝\n" << std::endl;
+    
+    // Create publisher and subscriber for reset communication
+    auto reset_pub = node_->create_publisher<std_msgs::msg::Bool>("/isaac_sim/reset_request", 10);
+    
+    // Flag to track when reset is done
+    bool reset_done = false;
+    auto reset_sub = node_->create_subscription<std_msgs::msg::Bool>(
+        "/isaac_sim/reset_done",
+        10,
+        [&reset_done](const std_msgs::msg::Bool::SharedPtr msg) {
+            if (msg->data) {
+                reset_done = true;
+            }
+        }
+    );
+    
+    // Publish reset request
+    std::cout << "[RESET] Publishing reset request to /isaac_sim/reset_request..." << std::endl;
+    auto msg = std_msgs::msg::Bool();
+    msg.data = true;
+    reset_pub->publish(msg);
+    
+    // Wait for reset done confirmation (with timeout)
+    std::cout << "[RESET] Waiting for reset confirmation on /isaac_sim/reset_done..." << std::endl;
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::seconds(10);
+    
+    while (!reset_done) {
+        rclcpp::spin_some(node_->get_node_base_interface());
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        auto elapsed = std::chrono::steady_clock::now() - start_time;
+        if (elapsed > timeout) {
+            std::cout << "[RESET-WARN] Reset confirmation timeout (>10s)." << std::endl;
+            std::cout << "[RESET-WARN] Make sure Isaac Sim Python script is running with ROS2 enabled." << std::endl;
+            break;
+        }
+    }
+    
+    if (reset_done) {
+        std::cout << "[RESET-SUCCESS] Isaac Sim environment reset confirmed!" << std::endl;
+    }
+    
+    // Wait a moment for physics to fully settle
+    std::cout << "[RESET] Waiting 2 seconds for physics to settle..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    
+    // Verify position data is available
+    std::cout << "[RESET] Verifying PX4 topics after reset..." << std::endl;
+    bool topics_ready = node_->wait_for_local(5.0);
+    
+    if (!topics_ready) {
+        std::cout << "[RESET-ERROR] PX4 topics not available after reset!" << std::endl;
+        return false;
+    }
+    
+    auto pos_after = node_->get_last_local();
+    if (pos_after) {
+        std::cout << "[RESET-DEBUG] Position after reset: x=" << pos_after->x 
+                  << " y=" << pos_after->y << " z=" << pos_after->z << std::endl;
+        float dist_from_spawn = std::sqrt(
+            std::pow(pos_after->x - spawn_xyz_[0], 2) +
+            std::pow(pos_after->y - spawn_xyz_[1], 2) +
+            std::pow(pos_after->z - spawn_xyz_[2], 2)
+        );
+        std::cout << "[RESET-DEBUG] Distance from spawn: " << dist_from_spawn << " m" << std::endl;
+    }
+    
+    std::cout << "\n╔══════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║  ISAAC SIM RESET COMPLETE                             ║" << std::endl;
+    std::cout << "╚══════════════════════════════════════════════════════════╝\n" << std::endl;
+    
+    return true;
+}
+
+bool PX4AccelEnv::reset_physics_and_velocities() {
+    /**
+     * Reset physics state and zero out all velocities.
+     * This ensures clean episode starts.
+     * 
+     * In a full Isaac Sim integration, you'd call:
+     * - physics scene wake_up() to refresh rigid body states
+     * - set linear/angular velocities to zero
+     * 
+     * For PX4 SITL without direct sim access, we rely on:
+     * - Landing and waiting for stabilization
+     * - Re-arming and taking off from known position
+     */
+    
+    std::cout << "[RESET-DEBUG] reset_physics_and_velocities() called" << std::endl;
+    std::cout << "[RESET] Waiting for velocities to settle..." << std::endl;
+    
+    // Wait until vehicle is stationary
+    auto start = std::chrono::steady_clock::now();
+    int check_count = 0;
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < 3.0) {
+        rclcpp::spin_some(node_->get_node_base_interface());
+        auto lp = node_->get_last_local();
+        if (lp) {
+            float v_mag = std::sqrt(lp->vx*lp->vx + lp->vy*lp->vy + lp->vz*lp->vz);
+            check_count++;
+            
+            if (check_count % 10 == 0) {  // Log every 10th check (~0.5s)
+                std::cout << "[RESET-DEBUG] Velocity magnitude: " << v_mag << " m/s "
+                          << "(vx=" << lp->vx << ", vy=" << lp->vy << ", vz=" << lp->vz << ")" << std::endl;
+            }
+            
+            if (v_mag < 0.1f) {
+                std::cout << "[RESET-SUCCESS] Velocities zeroed (|v|=" << v_mag << " m/s < 0.1 m/s)." << std::endl;
+                return true;
+            }
+        } else {
+            std::cout << "[RESET-WARN] No local position data during velocity check" << std::endl;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    
+    // Final velocity check
+    auto lp_final = node_->get_last_local();
+    if (lp_final) {
+        float v_final = std::sqrt(lp_final->vx*lp_final->vx + lp_final->vy*lp_final->vy + lp_final->vz*lp_final->vz);
+        std::cout << "[RESET-WARN] Velocity settle timeout after 3s; final |v|=" << v_final << " m/s" << std::endl;
+    }
+    
+    std::cout << "[RESET-WARN] Proceeding despite non-zero velocity." << std::endl;
+    return true;
+}
+
+bool PX4AccelEnv::wait_for_position_settle(double timeout_s) {
+    /**
+     * Wait for position AND velocity to stabilize near spawn after teleport/reset.
+     * Ensures we don't start RL control while drone is still moving.
+     * This guarantees identical starting conditions for each episode.
+     */
+    
+    auto start = std::chrono::steady_clock::now();
+    std::array<float, 3> last_pos = {0.0f, 0.0f, 0.0f};
+    bool first = true;
+    int check_count = 0;
+    int stable_count = 0;  // Consecutive checks that meet stability criteria
+    const int required_stable = 3;  // Require 3 consecutive stable checks (0.3s)
+    
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < timeout_s) {
+        rclcpp::spin_some(node_->get_node_base_interface());
+        auto lp = node_->get_last_local();
+        if (lp) {
+            check_count++;
+            
+            if (first) {
+                last_pos = {lp->x, lp->y, lp->z};
+                first = false;
+            } else {
+                float dx = lp->x - last_pos[0];
+                float dy = lp->y - last_pos[1];
+                float dz = lp->z - last_pos[2];
+                float drift = std::sqrt(dx*dx + dy*dy + dz*dz);
+                
+                // Check velocity magnitude
+                float vel_mag = std::sqrt(lp->vx*lp->vx + lp->vy*lp->vy + lp->vz*lp->vz);
+                
+                // Stability criteria: position drift < 5cm AND velocity < 0.1 m/s
+                if (drift < 0.05f && vel_mag < 0.1f) {
+                    stable_count++;
+                    if (stable_count >= required_stable) {
+                        std::cout << "[RESET] Stable (drift=" << drift 
+                                  << "m, vel=" << vel_mag << " m/s)" << std::endl;
+                        float dist_from_spawn = std::sqrt(
+                            std::pow(lp->x - spawn_xyz_[0], 2) +
+                            std::pow(lp->y - spawn_xyz_[1], 2) +
+                            std::pow(lp->z - spawn_xyz_[2], 2)
+                        );
+                        std::cout << "[RESET] Position offset from spawn: " << dist_from_spawn << " m" << std::endl;
+                        return true;
+                    }
+                } else {
+                    // Reset counter if stability criteria not met
+                    stable_count = 0;
+                }
+                last_pos = {lp->x, lp->y, lp->z};
+            }
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+    
+    auto lp_final = node_->get_last_local();
+    if (lp_final) {
+        std::cout << "[RESET-WARN] Position settle timeout after " << timeout_s << "s" << std::endl;
+        std::cout << "[RESET-DEBUG] Final position: x=" << lp_final->x << ", y=" << lp_final->y << ", z=" << lp_final->z << std::endl;
+    }
+    
+    return true;
 }

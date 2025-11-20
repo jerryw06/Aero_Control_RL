@@ -13,6 +13,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(px4_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(Torch REQUIRED)
 
 # Include directories
@@ -28,7 +30,7 @@ target_link_libraries(px4_node ${TORCH_LIBRARIES})
 
 # PX4 Accel Environment library
 add_library(px4_accel_env src/px4_accel_env.cpp)
-ament_target_dependencies(px4_accel_env rclcpp px4_msgs)
+ament_target_dependencies(px4_accel_env rclcpp px4_msgs std_srvs geometry_msgs)
 target_link_libraries(px4_accel_env px4_node ${TORCH_LIBRARIES})
 
 # Policy network library

@@ -51,3 +51,38 @@ PolicyImpl::sample_action(torch::Tensor obs_np) {
     
     return {a_tanh.squeeze(0), log_prob.squeeze(0), mu.squeeze(0), std.squeeze(0)};
 }
+
+torch::Tensor PolicyImpl::compute_log_prob(torch::Tensor obs_t, torch::Tensor act_t) {
+    // obs_t: [batch, obs_dim], act_t: [batch, act_dim]
+    auto [mu, std] = forward(obs_t);
+    
+    // Reverse tanh scaling to get pre-tanh action
+    auto act_scaled = act_t / act_limit_;
+    auto a = torch::atanh(act_scaled.clamp(-0.999, 0.999));
+    
+    // Compute log probability
+    auto log_prob = -0.5 * torch::pow((a - mu) / std, 2)
+                    - 0.5 * std::log(2 * M_PI) - torch::log(std);
+    log_prob = log_prob - torch::log(1 - torch::pow(act_scaled, 2) + 1e-6);
+    log_prob = log_prob.sum(-1, true);
+    
+    return log_prob;
+}
+
+// Value Network Implementation
+ValueNetworkImpl::ValueNetworkImpl(int obs_dim, int hidden, int num_layers) {
+    net_ = torch::nn::Sequential();
+    int in_dim = obs_dim;
+    for (int i = 0; i < num_layers; ++i) {
+        net_->push_back(torch::nn::Linear(in_dim, hidden));
+        net_->push_back(torch::nn::LayerNorm(torch::nn::LayerNormOptions({hidden})));
+        net_->push_back(torch::nn::Tanh());
+        in_dim = hidden;
+    }
+    net_->push_back(torch::nn::Linear(hidden, 1));
+    register_module("net", net_);
+}
+
+torch::Tensor ValueNetworkImpl::forward(torch::Tensor obs_t) {
+    return net_->forward(obs_t).squeeze(-1);
+}

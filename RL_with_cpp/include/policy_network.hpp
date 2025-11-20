@@ -13,6 +13,9 @@ public:
     
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> 
     sample_action(torch::Tensor obs_np);
+    
+    // Compute log probability for given observation and action (for PPO)
+    torch::Tensor compute_log_prob(torch::Tensor obs_t, torch::Tensor act_t);
 
     double get_act_limit() const { return act_limit_; }
 
@@ -24,5 +27,18 @@ private:
 };
 
 TORCH_MODULE(Policy);
+
+// Value network (critic) for PPO
+class ValueNetworkImpl : public torch::nn::Module {
+public:
+    ValueNetworkImpl(int obs_dim = 6, int hidden = 512, int num_layers = 4);
+    
+    torch::Tensor forward(torch::Tensor obs_t);
+
+private:
+    torch::nn::Sequential net_{nullptr};
+};
+
+TORCH_MODULE(ValueNetwork);
 
 #endif // POLICY_NETWORK_HPP

@@ -7,6 +7,9 @@
 #include <vector>
 #include <deque>
 #include <memory>
+#include <string>
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 struct StepResult {
     torch::Tensor observation;  // [12]: [x, y, z, vx, vy, vz, roll, pitch, yaw, p, q, r]
@@ -63,6 +66,8 @@ private:
     bool arm_offboard();
     void publish_rl_attitude(const std::array<float, 3>& rpy_rad,
                              float thrust_body_z);
+    // Graceful control handoff helpers
+    void hold_position_for(double seconds);
     std::array<float, 4> euler_to_quat(float roll, float pitch, float yaw) const;
     std::array<float, 3> quat_to_euler(const std::array<float, 4>& quat) const;
     void update_attitude_cache();
@@ -71,12 +76,17 @@ private:
     void reset_reward_tracking();
     std::string pose_to_str(const std::array<float, 3>& ned) const;
     bool wait_until_grounded(double timeout_s = 10.0, double vz_tol = 0.15, double stable_s = 1.0);
+    
+    // Isaac Sim reset/teleport integration
+    bool teleport_to_spawn();
+    bool reset_physics_and_velocities();
+    bool wait_for_position_settle(double timeout_s = 3.0);
 
-    // Configuration
-    double rate_hz_;
-    double requested_rate_hz_;
-    double rate_cap_hz_;
-    double dt_;
+    // Configuration (order matters: used in initializer list dependencies)
+    double rate_cap_hz_;        // Must be first: used to cap rate_hz_
+    double requested_rate_hz_;  // Second: stores original request
+    double rate_hz_;            // Third: computed from requested and cap
+    double dt_;                 // Fourth: computed from rate_hz_
     double a_max_;
     int max_steps_;
     double target_up_;
@@ -145,6 +155,9 @@ private:
     std::array<float, 3> current_body_rates_rad_s_;
     float hover_z_ned_;
     
+    // Isaac Sim script restart (no service needed, uses system commands)
+    bool use_isaac_sim_reset_;
+    
     int step_;
     bool episode_running_;
     bool ready_for_rl_;
@@ -175,6 +188,13 @@ private:
     double freq_monitor_start_time_;
     int freq_monitor_step_count_;
     double last_step_wall_time_;
+    // RL takeoff guard: prevent vertical & yaw control by policy until stable hover
+    bool vertical_hold_active_ = false;          // true => override az & yaw from policy
+    int vertical_stable_steps_ = 0;              // consecutive steps meeting stability criteria
+    int required_stable_steps_ = 0;              // threshold to disable guard (computed from rate)
+    double vertical_release_z_tol_ = 0.15;       // max |z| (local) to consider stable (m)
+    double vertical_release_vz_tol_ = 0.25;      // max |vz| to consider stable (m/s)
+    int vertical_guard_log_count_ = 0;           // limit logging spam
 };
 
 #endif // PX4_ACCEL_ENV_HPP

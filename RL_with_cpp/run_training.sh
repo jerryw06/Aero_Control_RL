@@ -34,8 +34,13 @@ choose_rmw() {
 
 choose_rmw
 
+# Suppress CycloneDDS type hash warnings (harmless ROS2 Jazzy introspection warnings)
+export RCUTILS_CONSOLE_OUTPUT_FORMAT="[{severity}] [{name}]: {message}"
+export RCUTILS_LOGGING_USE_STDOUT=1
+export RCUTILS_LOGGING_BUFFERED_STREAM=1
+
 # Source ROS2
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/jazzy/setup.bash 2>/dev/null
 
 # Source px4_msgs if available (user or local)
 if [ -f "$HOME/ros2_ws/install/setup.bash" ]; then
@@ -91,4 +96,5 @@ if ! ros2 topic list 2>/dev/null | grep -q "/fmu/vehicle_local_position/out"; th
     # Proceed anyway, trainer will wait, but this helps diagnose earlier.
 fi
 
-ros2 run rl_with_cpp train_rl "$@"
+# Filter out CycloneDDS type hash warnings (harmless, but cluttering)
+ros2 run rl_with_cpp train_rl "$@" 2>&1 | grep -v "Failed to parse type hash"
